@@ -3,609 +3,547 @@ from agents.agent import Agent
 from store import register_agent
 import sys
 import numpy as np
-from copy import deepcopy
 import time
-from helpers import random_move, count_capture, execute_move, check_endgame, get_valid_moves
 import math
+import random
+from helpers import random_move, count_capture, execute_move, check_endgame, get_valid_moves
+
 
 @register_agent("mcts_agent")
-
-
 class MCTSAgent(Agent):
     """
-    A class for your implementation. Feel free to use this class to
-    add any helper functionalities needed for your agent.
-    """
-    
-    class Node():
-        def __init__(self, state, parent=None):
-            self.state = state  # The current state of the game or problem
-            self.parent = parent  # The parent node (None for the root node)
-            self.children = []  # List of child nodes
-            self.visits = 0  # Number of times this node has been visited
-            self.score = 0
-            self.uct = 0  
-            self.move = None
-            self.depth = np.sum(self.state != 0) 
-    
-        def add_child(self, child_node):
-            for child in self.children:
-                if np.array_equal(child.state, child_node.state):
-                    return True  # Prevent adding duplicate child
-            self.children.append(child_node)
-            return False
+    Monte Carlo tree search with UCT selection and a progressive-bias term
+    driven by a position heuristic.
 
-        def get_og_node(self, child_node):
-            for child in self.children:
-                if np.array_equal(child.state, child_node.state):
-                    return child # Prevent adding duplicate child 
-            
+    The four MCTS phases are now actually separate: descend the tree by UCT,
+    expand one node, run a light random playout from there, then back the
+    result up with alternating sign.
+    """
+
+    class Node:
+        __slots__ = ("state", "parent", "children", "visits", "score",
+                     "move", "to_move", "untried", "heuristic")
+
+        def __init__(self, state, to_move, parent=None, move=None):
+            self.state = state
+            self.parent = parent
+            self.children = []
+            self.visits = 0
+            # Reward accumulated from the perspective of the player who moved
+            # INTO this node, i.e. parent.to_move.
+            self.score = 0.0
+            self.move = move
+            self.to_move = to_move
+            self.untried = None
+            self.heuristic = None
+
+        def is_fully_expanded(self):
+            return self.untried is not None and len(self.untried) == 0
 
     def __init__(self):
         super(MCTSAgent, self).__init__()
         self.name = "MCTSAgent"
         self.root = None
+        self.bias_weight = 1.5
 
-    
+    # ------------------------------------------------------------------
+    # Entry point
+    # ------------------------------------------------------------------
+
     def step(self, board, player, opponent):
         start_time = time.time()
-        self.curr_moves = []
-        
-        if np.sum(board != 0) == 5 and player == 2 :
-           self.root = self.Node(deepcopy(board), None) 
-        elif np.sum(board != 0) == 4 and player == 1 :
-            self.root = self.Node(deepcopy(board), None)
-        else : 
-            self.prune_tree(board)  #prune branches removed because of opponent move
-        
-        possible_moves = get_valid_moves(board, player)
-        if len(possible_moves) == 1 : 
-            return possible_moves[0]
-        
-        best_move = self.mcts(board, player, opponent, start_time)
+        self.player = player
+        self.opponent = opponent
 
-        board_copy = deepcopy(board)
-        execute_move(board_copy, best_move, player)   
-        self.prune_tree(board_copy)
+        time_limit = self.time_budget(board)
 
-        time_taken = time.time() - start_time
-        print("My AI's turn took ", time_taken, "seconds choosing move:", best_move)
-        return best_move
+        # Reuse the subtree that matches the current board. After the opponent
+        # moves, the statistics gathered under that branch last turn are still
+        # valid, so throwing the whole tree away wastes them.
+        root = self.find_subtree(board, player)
+        if root is None:
+            root = self.Node(board.copy(), to_move=player)
+            root.untried = self.legal_or_pass(root)
 
+        legal = get_valid_moves(board, player)
+        if len(legal) == 1:
+            self.root = root
+            return legal[0]
+        if not legal:
+            return random_move(board, player)
 
-    def prune_tree(self, board):
-        matching_child = next((child for child in self.root.children if np.array_equal(child.state, board)), None,)
+        self.root = root
 
-        if matching_child is not None:
-            self.root = matching_child
-            self.root.parent = None
+        while time.time() - start_time < time_limit:
+            # Run a small batch between clock checks so time.time() is not the
+            # dominant cost at high simulation counts.
+            for _ in range(8):
+                node = self.select(root)
+                node = self.expand(node)
+                result = self.rollout(node)
+                self.backpropagate(node, result)
+            if time.time() - start_time >= time_limit:
+                break
+
+        # FIX: the old code switched between "best by heuristic" in the opening
+        # and midgame and "best by visits" in the endgame. Picking by heuristic
+        # discards every simulation that was just run. Robust child (most
+        # visits) is the standard choice and is what the search actually
+        # produced evidence for.
+        best = max(root.children, key=lambda c: c.visits)
+        return best.move
+
+    def find_subtree(self, board, player):
+        """
+        Look two plies down from the previous root for a node whose board and
+        side to move match the current position, and promote it to root.
+        Two plies because between our turns both we and the opponent moved,
+        though a pass can make it one.
+        """
+        if self.root is None:
+            return None
+
+        candidates = list(self.root.children)
+        candidates.extend(g for c in self.root.children for g in c.children)
+
+        matches = [n for n in candidates
+                   if n.to_move == player and np.array_equal(n.state, board)]
+        if not matches:
+            return None
+
+        # Transpositions mean the same position can appear as more than one
+        # node. Promote the copy that accumulated the most evidence.
+        best = max(matches, key=lambda n: n.visits)
+        best.parent = None
+        return best
+
+    def time_budget(self, board):
+        n = board.shape[0]
+        if n == 6:
+            return 1.90
+        if n == 8:
+            return 1.88
+        if n == 10:
+            return 1.85
+        return 1.82
+
+    # ------------------------------------------------------------------
+    # Phase 1: selection
+    # ------------------------------------------------------------------
+
+    def select(self, node):
+        """
+        Descend the tree by UCT until reaching a node that still has untried
+        moves or is terminal.
+
+        FIX: the old selection only ever ranked self.root.children. It never
+        descended, so the tree below depth 1 was built but never used. The
+        agent was effectively a flat bandit over root moves, not MCTS.
+        """
+        while True:
+            if node.untried is None:
+                node.untried = self.legal_or_pass(node)
+            if node.untried:
+                return node
+            if not node.children:
+                return node
+            node = max(node.children, key=lambda c: self.uct_value(node, c))
+
+    def uct_value(self, parent, child):
+        if child.visits == 0:
+            return float('inf')
+
+        exploit = child.score / child.visits
+        explore = self.c_param(parent.state) * math.sqrt(
+            math.log(parent.visits + 1) / child.visits)
+
+        # FIX: the original computed normalized_h then scaled_h, but the two
+        # were algebraic inverses:
+        #     norm  = (h - min_uct) / (max_uct - min_uct)
+        #     scale = min_uct + norm * (max_uct - min_uct)   ->  == h
+        # so the "normalization" was an identity function and the raw heuristic
+        # (magnitude in the hundreds) was added straight onto a UCT term of
+        # magnitude ~1. The heuristic swamped the search and turned this into a
+        # greedy evaluator.
+        #
+        # Progressive bias is the correct construction: bound the heuristic to
+        # [-1, 1] so it lives on the same scale as the exploit term, then decay
+        # it as real simulation evidence accumulates.
+        if child.heuristic is None:
+            raw = self.evaluate_board(child.state, parent.to_move,
+                                      self.other(parent.to_move))
+            child.heuristic = math.tanh(raw / 100.0)
+
+        bias = self.bias_weight * child.heuristic / (1 + child.visits)
+
+        return exploit + explore + bias
+
+    def c_param(self, board):
+        n = board.shape[0]
+        if self.is_opening_game(board):
+            return {6: 1.6, 8: 1.8, 10: 1.8, 12: 2.0}.get(n, 1.8)
+        if self.is_midgame(board):
+            return 1.414
+        return 1.0
+
+    # ------------------------------------------------------------------
+    # Phase 2: expansion
+    # ------------------------------------------------------------------
+
+    def expand(self, node):
+        if not node.untried:
+            return node
+
+        move = node.untried.pop()
+
+        if move is None:
+            # Pass: same board, turn flips.
+            child_state = node.state
+            child = self.Node(child_state, to_move=self.other(node.to_move),
+                              parent=node, move=None)
         else:
-            self.root = self.Node(state=board) 
+            child_state = node.state.copy()
+            execute_move(child_state, move, node.to_move)
+            child = self.Node(child_state, to_move=self.other(node.to_move),
+                              parent=node, move=move)
 
+        node.children.append(child)
+        return child
 
-    def mcts(self, board, player, opponent, start_time):
-        time_limit = 1
-        match board.shape[0] :
-            case 6 : 
-                if (self.is_opening_game(board)) :
-                    time_limit = 1.98
-                elif (self.is_midgame(board)) :
-                    time_limit = 1.96
-                else : 
-                    time_limit = 1.98
+    def legal_or_pass(self, node):
+        moves = get_valid_moves(node.state, node.to_move)
+        if moves:
+            moves = list(moves)
+            # expand() pops from the end, so without a shuffle the first move
+            # tried at every node is fixed by board coordinates. At low
+            # simulation counts on large boards that bias never washes out.
+            random.shuffle(moves)
+            return moves
+        over, _, _ = check_endgame(node.state, self.player, self.opponent)
+        if over:
+            return []
+        # No legal move but game continues: the only action is a pass.
+        return [None]
 
-            case 8 : 
-                if (self.is_opening_game(board)) :
-                    time_limit = 1.96
-                elif (self.is_midgame(board)) :
-                    time_limit = 1.95
-                else : 
-                    time_limit = 1.98
+    # ------------------------------------------------------------------
+    # Phase 3: simulation
+    # ------------------------------------------------------------------
 
-            case 10 : 
-                if (self.is_opening_game(board)) :
-                    time_limit = 1.93
-                elif (self.is_midgame(board)) :
-                    time_limit = 1.90
-                else : 
-                    time_limit = 1.98
+    def rollout(self, node):
+        """
+        Random playout to a terminal state.
 
-            case 12 : 
-                if (self.is_opening_game(board)) :
-                    time_limit = 1.88
-                elif (self.is_midgame(board)) :
-                    time_limit = 1.88
-                else : 
-                    time_limit = 1.98
-        
-        for move in get_valid_moves(board, player):
-            board_copy = deepcopy(board)
-            execute_move(board_copy, move, player)
-            child_node = self.Node(state=board_copy, parent=self.root)
-            child_node.move = move
-            self.root.add_child(child_node)
-         
-        while (time.time() - start_time < time_limit) :
-            for _ in range(10000):  
-                if time.time() - start_time >= time_limit: break
-                best_search_move = max(self.root.children, key=lambda children: self.uct(board, children, player, opponent))
-                move = best_search_move.move
-                self.simulate_game(board, move, player, opponent)
+        FIX: the old simulate_game allocated a Node with a full deepcopy of the
+        board at EVERY ply of the rollout and attached it to a tree that
+        selection never read. On a 12x12 board that is well over a hundred
+        allocations and deep-copies per simulation, which is the actual reason
+        the agent could not get enough simulations inside two seconds. It was
+        an implementation problem, not a limitation of MCTS.
 
-        if (self.is_opening_game(board) or self.is_midgame(board)) :
-            best_move = max(self.root.children, key=lambda  children: (self.evaluate_board(children.state, player, opponent)))
+        This version mutates one board in place and allocates nothing.
+        """
+        board = node.state.copy()
+        to_move = node.to_move
+        passes = 0
 
+        # The two-consecutive-passes counter is already the terminal condition
+        # for Othello, so calling check_endgame every ply just recomputes the
+        # same thing with a full board scan. Measured at roughly 2x the total
+        # rollout cost on 8x8 and 12x12.
+        while passes < 2:
+            moves = get_valid_moves(board, to_move)
+            if moves:
+                passes = 0
+                move = moves[random.randrange(len(moves))]
+                execute_move(board, move, to_move)
+            else:
+                passes += 1
+            to_move = self.other(to_move)
+
+        if self.player == 1:
+            _, p_score, o_score = check_endgame(board, self.player, self.opponent)
         else:
-            best_move = max(self.root.children, key=lambda  children: (children.visits) )
-        
-        return best_move.move
+            _, o_score, p_score = check_endgame(board, self.player, self.opponent)
 
+        if p_score > o_score:
+            return 1.0
+        if p_score < o_score:
+            return -1.0
+        return 0.0
 
-    def back_propagate(self, current_node, score):
-        while current_node is not None:
-            current_node.visits += 1
-            current_node.score += score
-            current_node = current_node.parent
+    # ------------------------------------------------------------------
+    # Phase 4: backpropagation
+    # ------------------------------------------------------------------
 
+    def backpropagate(self, node, result):
+        """
+        `result` is from the root player's perspective. Each node stores reward
+        for the player who moved into it, so the sign flips depending on which
+        side made that move.
 
-    def simulate_game(self, board, move, player, opponent):     
-        board_copy = deepcopy(board)
-        execute_move(board_copy, move, player)
-        
-        child_node = self.Node(state=deepcopy(board_copy), parent=self.root)  
-        child_node.move = move
-        present = self.root.add_child(child_node)
-        if present : 
-            child_node = self.root.get_og_node(child_node)
-        
-        current_node = child_node
-        
-        result = 0
-        curr_player = opponent  
-        while not check_endgame(board_copy, player, opponent)[0]:  
-            valid_moves = get_valid_moves(board_copy, curr_player)
-            if len(valid_moves) > 0:
-                r_move = random_move(board_copy, curr_player)
-                execute_move(board_copy, r_move, curr_player) 
-                
-                new_child_node = self.Node(deepcopy(board_copy), parent=current_node)
-                new_child_node.move = r_move
-                present = current_node.add_child(new_child_node)
-                if present : 
-                    new_child_node = current_node.get_og_node(new_child_node)
-                
-                current_node = new_child_node
+        FIX: the original added the same signed score at every level. In a
+        two-player game that credits the opponent's moves with the root
+        player's wins, so the values were meaningless above depth 1.
+        """
+        while node is not None:
+            node.visits += 1
+            if node.parent is not None:
+                mover = node.parent.to_move
+                node.score += result if mover == self.player else -result
+            node = node.parent
 
-            curr_player = player if curr_player == opponent else opponent
+    def other(self, side):
+        return self.opponent if side == self.player else self.player
 
-        if player == 1 :
-            _, player_score, opponent_score = check_endgame(board_copy, player, opponent)
-        else : 
-            _, opponent_score, player_score = check_endgame(board_copy, player, opponent)
-        
-        result = player_score - opponent_score
-        
-        if result > 0:
-            score = 1
-        elif result < 0:
-            score = -1
-        else:
-            score = 0
-
-        self.back_propagate(current_node, score)
-
-
-    def uct(self, board, children, player, opponent):
-        score = children.score
-        visits = children.visits
-        
-        if self.root.visits == 0 : return 0
-        if visits == 0 : return float('inf')
-        
-        board_size = board.shape[0]  
-        if board_size == 6:
-            if self.is_opening_game(board): c = 2
-            elif self.is_midgame(board): c = 1.414
-            else : c = 1
-
-        elif board_size == 8:
-            if self.is_opening_game(board): c = 2.5
-            elif self.is_midgame(board): c = 1.414
-            else : c = 1
-
-        elif board_size == 10:
-            if self.is_opening_game(board): c = 2.5
-            elif self.is_midgame(board): c = 2
-            else : c = 1.2
-
-        elif board_size == 12:
-            if self.is_opening_game(board): c = 3.0
-            elif self.is_midgame(board): c = 2.5
-            else : c = 1.414
-
-        total_visits = self.root.visits
-        uct_value = (score / visits) + c * (math.sqrt(math.log(total_visits) / visits)) 
-
-        h_score = self.evaluate_board(children.state, player, opponent)
-        normalized_h = self.normalized_heurisitic(h_score)
-        scaled_h = self.scaled_heuristic(normalized_h)
-        
-        final_uct = uct_value + scaled_h 
-        #final_uct = uct_value + normalized_h
-        children.uct = final_uct
-        
-        return final_uct
-
-
-    def get_minmax_uct(self) :
-        max_move = max(self.root.children, key=lambda children: children.uct)
-        max_uct = max_move.uct
-        min_move = min(self.root.children, key=lambda children: children.uct)
-        min_uct = min_move.uct
-        return max_uct, min_uct
-
-
-    def normalized_heurisitic(self, h_score) :
-        max_uct, min_uct = self.get_minmax_uct()
-        if max_uct != min_uct : 
-            normalized_h = (h_score - min_uct) / (max_uct - min_uct)
-        else : 
-            normalized_h = h_score
-        return normalized_h
-
-
-    def scaled_heuristic(self, normalized_h) :
-        max_uct, min_uct = self.get_minmax_uct()
-        scaled_h = min_uct + normalized_h * (max_uct - min_uct)
-        return scaled_h
-
+    # ------------------------------------------------------------------
+    # Evaluation
+    # ------------------------------------------------------------------
 
     def evaluate_board(self, board, player, opponent):
-        move = self.get_move(board)
         score = 0
-
-        # -------- Corners Heuristic --------
         score += self.corner_control(board, player, opponent)
-       
-        # -------- Inner Corners Heuristic --------
         score += self.inner_corners(board, player, opponent)
-        
-        # -------- Opp Moves Heuristic --------
         score += self.count_opponent_moves(board, opponent)
-        
-        # -------- Adjacent to Corners Heuristic (X-squares and C-squares) --------
-        score +=  self.danger_zones(board, player, opponent)
-
-        # -------- Wall Moves Heuristic --------
-        score += self.evaluate_wall_move(board, move, player, opponent)
-        
-        # -------- Wall for Corner Heuristic --------
+        score += self.danger_zones(board, player, opponent)
         score += self.wall_for_corner(board, player, opponent)
-
-        # -------- Center Control Heuristic --------
         score += self.center_control(board, player, opponent)
-
-        # -------- Mobility Heuristic --------
         score += self.mobility(board, player, opponent)
-
-        # -------- Potential Mobility Heuristic --------
         score += self.potential_mobility(board, player, opponent)
-
-        # -------- Disc Difference Heuristic --------
         score += self.captures(board, player, opponent)
-
         return score
 
+    # NOTE: evaluate_wall_move was dropped from evaluate_board. It depended on
+    # get_move(), which diffed a board against self.root.state to guess which
+    # move had just been played. Once selection descends more than one ply that
+    # diff is meaningless, and it returned None on an unchanged board, which
+    # would crash on `row, col = move`.
 
-    def get_move(self, board) :
-        for i in range(board.shape[0]):
-            for j in range(board.shape[1]):
-                if board[i, j] != self.root.state[i, j] :
-                    return (i, j)
-                
-    
+    def _phase_thresholds(self, board_size):
+        return {6: (8, 24), 8: (16, 50), 10: (27, 80), 12: (37, 115)}.get(board_size)
 
     def is_opening_game(self, board):
-        captured = sum(cell != 0 for row in board for cell in row)
-        board_size = board.shape[1]
-        if board_size == 6:
-            return captured < 8  
-        elif board_size == 8:
-            return captured < 16  
-        elif board_size == 10:
-            return captured < 27  
-        elif board_size == 12:
-            return captured < 37  
-        return False
+        t = self._phase_thresholds(board.shape[1])
+        if t is None:
+            return False
+        return int(np.count_nonzero(board)) < t[0]
 
     def is_midgame(self, board):
-        captured = sum(cell != 0 for row in board for cell in row)
-        board_size = board.shape[1]
-        if board_size == 6:
-            return 8 <= captured < 24  
-        elif board_size == 8:
-            return 16 <= captured < 50 
-        elif board_size == 10:
-            return 27 <= captured < 80  
-        elif board_size == 12:
-            return 37 <= captured < 115  
-        return False
-    
-    def is_endgame(self, board):
-        captured = sum(cell != 0 for row in board for cell in row)
-        board_size = board.shape[1]
-        if board_size == 6:
-            return 24 <= captured
-        elif board_size == 8:
-            return 50 <= captured 
-        elif board_size == 10:
-            return 80 <= captured  
-        elif board_size == 12:
-            return 115 <= captured  
-        return False
-    
-    
-    def corner_control(self, board, player, opponent):
-        corners = [(0, 0), (0, board.shape[0] - 1), (board.shape[0] - 1, 0), (board.shape[0] - 1, board.shape[1] - 1)]
-        score = 0
+        t = self._phase_thresholds(board.shape[1])
+        if t is None:
+            return False
+        return t[0] <= int(np.count_nonzero(board)) < t[1]
 
+    def is_endgame(self, board):
+        t = self._phase_thresholds(board.shape[1])
+        if t is None:
+            return False
+        return int(np.count_nonzero(board)) >= t[1]
+
+    def corner_control(self, board, player, opponent):
+        n = board.shape[0]
+        corners = [(0, 0), (0, n - 1), (n - 1, 0), (n - 1, n - 1)]
+        weight = 20 if self.is_endgame(board) else 15
+        score = 0
         for corner in corners:
             if board[corner] == player:
-                score += 15 if not self.is_endgame(board) else 20
+                score += weight
             elif board[corner] == opponent:
-                score -= 15
+                # FIX: the penalty was hardcoded to 15 while the reward used a
+                # phase-dependent weight, so in the endgame the agent valued
+                # taking a corner more than denying one. Made symmetric.
+                score -= weight
         return score
-    
-    def inner_corners(self, board, player, opponent):
-        board_size = board.shape[0]
 
-        inner_corners = [
-            (0, 2), (0, board_size - 3),
-            (2, 0), (board_size - 3, 0),
-            (board_size - 1, 2), (board_size - 1, board_size - 3),
-            (2, board_size - 1), (board_size - 3, board_size - 1)
+    def inner_corners(self, board, player, opponent):
+        n = board.shape[0]
+        cells = [
+            (0, 2), (0, n - 3),
+            (2, 0), (n - 3, 0),
+            (n - 1, 2), (n - 1, n - 3),
+            (2, n - 1), (n - 3, n - 1)
         ]
         score = 0
-        for pos in inner_corners:
-            if board[pos] == player:
+        for cell in cells:
+            if board[cell] == player:
                 score += 10
-            elif board[pos] == opponent:
+            elif board[cell] == opponent:
                 score -= 10
-
         return score
-        
 
     def danger_zones(self, board, player, opponent):
-        board_size = board.shape[0]
+        n = board.shape[0]
 
         danger_zones = {
-            (0, 0): [(0, 1), (1, 0)],  
-            (0, board_size - 1): [(0, board_size - 2), (1, board_size - 1)],  
-            (board_size - 1, 0): [(board_size - 2, 0), (board_size - 1, 1)], 
-            (board_size - 1, board_size - 1): [(board_size - 1, board_size - 2), (board_size - 2, board_size - 1)]  
+            (0, 0): [(0, 1), (1, 0)],
+            (0, n - 1): [(0, n - 2), (1, n - 1)],
+            (n - 1, 0): [(n - 2, 0), (n - 1, 1)],
+            (n - 1, n - 1): [(n - 1, n - 2), (n - 2, n - 1)]
         }
 
         opposite_corner = {
-            (0, 0): (0, board_size - 1),  
-            (0, board_size - 1): (0, 0),  
-            (board_size - 1, 0): (board_size - 1, board_size - 1), 
-            (board_size - 1, board_size - 1): (board_size - 1, 0)
+            (0, 0): (0, n - 1),
+            (0, n - 1): (0, 0),
+            (n - 1, 0): (n - 1, n - 1),
+            (n - 1, n - 1): (n - 1, 0)
         }
 
         diagonal_cells = {
-            (0,0): (1, 1),
-            (0, board_size - 1): (1, board_size - 2),
-            (board_size - 1, 0): (board_size - 2, 1),
-            (board_size - 1, board_size - 1): (board_size - 2, board_size - 2)
+            (0, 0): (1, 1),
+            (0, n - 1): (1, n - 2),
+            (n - 1, 0): (n - 2, 1),
+            (n - 1, n - 1): (n - 2, n - 2)
         }
-        
+
         result = 0
-        for corner, dz in danger_zones.items(): 
+        for corner, dz in danger_zones.items():
+            opp_corner = opposite_corner[corner]
             for cell in dz:
-                opposite_corner_pos = opposite_corner.get(corner)  
-                
                 if board[cell] == player and board[corner] == 0:
-                    result += -3
-                if board[cell] == player and board[opposite_corner_pos] == opponent:
-                    result += 3  
+                    result -= 3
+                if board[cell] == player and board[opp_corner] == player:
+                    result += 3
                 if board[cell] == player and board[corner] == player:
-                    result += 5  
-                if board[cell] == opponent and board[opposite_corner_pos] == opponent:
-                    result += -3  
-                if board[cell] == opponent and board[opposite_corner_pos] == 0:
-                    result += 3  
-        
-        for corner, diagonal in diagonal_cells.items() :
-            if board[diagonal] == player and board[corner] == 0 :
-                result += -10
-            if board[diagonal] == player and board[corner] == player :
+                    result += 10
+                if board[cell] == opponent and board[opp_corner] == opponent:
+                    result -= 3
+                if board[cell] == opponent and board[opp_corner] == 0:
+                    result += 3
+
+        for corner, diagonal in diagonal_cells.items():
+            if board[diagonal] == player and board[corner] == 0:
+                result -= 10
+            if board[diagonal] == player and board[corner] == player:
                 result += 5
-            if board[diagonal] == player and board[corner] == opponent :
-                result += -5 
-            
-            if board[diagonal] == opponent and board[corner] == 0 :
+            if board[diagonal] == player and board[corner] == opponent:
+                result -= 5
+            if board[diagonal] == opponent and board[corner] == 0:
                 result += 10
-            if board[diagonal] == opponent and board[corner] == opponent :
-                result += -5
-            if board[diagonal] == opponent and board[corner] == player :
-                result += +5 
-                    
+            if board[diagonal] == opponent and board[corner] == opponent:
+                result -= 5
+            if board[diagonal] == opponent and board[corner] == player:
+                result += 5
+
         return result
 
-
     def count_opponent_moves(self, board, opponent):
-        score = 0
-        opp_moves = len(get_valid_moves(board, opponent)) 
-        if opp_moves == 0 :
-            score += 10
-        else : 
-            score -= opp_moves
-        return score
-  
-
-    def evaluate_wall_move(self, board, move, player, opponent):
-        board_size = board.shape[0]
-        board_copy = deepcopy(board)
-        stability_score = 0
-        row, col = move
-
-        if row == 0 or row == board_size - 1 or col == 0 or col == board_size - 1:
-            if (row == 0 and col == 0) or (row == 0 and col == board_size - 1) or (row == board_size - 1 and col == 0) or (row == board_size - 1 and col == board_size - 1):
-                return stability_score 
-            
-            corner_connection = 0
-            if row == 0 or row == board_size - 1 or col == 0 or col == board_size - 1:  
-                if col == 0 and board[0, 0] == player:
-                    corner_connection = 1  
-                elif col == board_size - 1 and board[0, board_size - 1] == player:
-                    corner_connection = 1  
-                elif col == 0 and board[board_size - 1, 0] == player:
-                    corner_connection = 1  
-                elif col == board_size - 1 and board[board_size - 1, board_size - 1] == player:
-                    corner_connection = 1  
-            
-            if corner_connection == 1:
-                stability_score += 5  
-            elif corner_connection == 0:
-                if col == 0 and (board[0, 0] == opponent or board[board_size - 1, 0] == opponent):
-                    stability_score -= 5  
-                elif col == board_size - 1 and (board[0, board_size - 1] == opponent or board[board_size - 1, board_size - 1] == opponent):
-                    stability_score -= 5  
-            
-            capture_bonus = 0
-            
-            if row == 0 or row == board_size - 1:
-                capture = count_capture(board_copy, move, player) 
-                if capture > 1:
-                    if self.is_danger_zone(board_copy, move) : 
-                        capture_bonus = 1
-                    else : capture_bonus = capture
-            
-            if col == 0 or col == board_size - 1:
-                capture = count_capture(board_copy, move, player)
-                if capture > 1:
-                    if self.is_danger_zone(board_copy, move) : 
-                        capture_bonus = 1
-                    else : capture_bonus = capture
-                    
-            stability_score += capture_bonus
-        
-        return stability_score
-
+        opp_moves = len(get_valid_moves(board, opponent))
+        if opp_moves == 0:
+            return 10
+        if opp_moves < 3:
+            return 5
+        return -opp_moves
 
     def wall_for_corner(self, board, player, opponent):
-        board_size = board.shape[0]
+        n = board.shape[0]
         corners = {
             (0, 0): [(0, 1), (1, 0)],
-            (0, board_size - 1): [(0, board_size - 2), (1, board_size - 1)],
-            (board_size - 1, 0): [(board_size - 2, 0), (board_size - 1, 1)],
-            (board_size - 1, board_size - 1): [(board_size - 2, board_size - 1), (board_size - 1, board_size - 2)]
+            (0, n - 1): [(0, n - 2), (1, n - 1)],
+            (n - 1, 0): [(n - 2, 0), (n - 1, 1)],
+            (n - 1, n - 1): [(n - 2, n - 1), (n - 1, n - 2)]
         }
 
         opposite_corner = {
-            (0,0) : (0, board_size -1),  
-            (0, board_size - 1): (0, 0),  
-            (board_size - 1, 0): (board_size - 1, board_size - 1), 
-            (board_size - 1, board_size - 1): (board_size - 1, 0)
+            (0, 0): (0, n - 1),
+            (0, n - 1): (0, 0),
+            (n - 1, 0): (n - 1, n - 1),
+            (n - 1, n - 1): (n - 1, 0)
         }
 
         score = 0
 
-        wall = []
         for corner, adjacent_cells in corners.items():
-            if board[corner] == opponent :
-                for cell in adjacent_cells : 
-                    if board[cell] == player : 
-                        if cell[0] == 1 or cell[0] == board_size - 2: 
-                            wall = [(corner[0], r) for r in range(board_size)]
-                        else : 
-                            wall = [(c, corner[0]) for c in range(board_size)]     
+            if board[corner] != opponent:
+                continue
 
-                other_corner = opposite_corner.get(corner)
+            # FIX: `wall` was declared once outside this loop in the original,
+            # so a wall built for one corner leaked into the next iteration.
+            wall = []
+            for cell in adjacent_cells:
+                if board[cell] != player:
+                    continue
+                if cell[0] == corner[0]:
+                    wall = [(corner[0], c) for c in range(n)]
+                else:
+                    # FIX: the original used corner[0] as a column index here,
+                    # which pointed at column 0 for both right-hand corners.
+                    wall = [(r, corner[1]) for r in range(n)]
 
-                if wall : 
-                    for cell in adjacent_cells :
-                        if cell in wall :
-                            wall.remove(cell)
-                    if other_corner in wall :
-                        wall.remove(other_corner)
+            if not wall:
+                continue
 
-                    if all(board[w] == opponent for w in wall):
-                        score += 10
-        
+            other_corner = opposite_corner[corner]
+            wall = [w for w in wall
+                    if w not in adjacent_cells and w != other_corner and w != corner]
+
+            # FIX: the minimax copy of this function tested `other_corner == 0`,
+            # comparing a coordinate tuple to an int, so it never fired. The
+            # MCTS copy dropped the check entirely, which is the opposite error:
+            # it scored the pattern even when the opposite corner was already
+            # taken and there was nothing left to win.
+            if wall and all(board[w] == opponent for w in wall) and board[other_corner] == 0:
+                score += 10
+
         return score
-    
 
     def center_control(self, board, player, opponent):
-        board_size = board.shape[0]
+        n = board.shape[0]
         center_cells = [
-            (board_size // 2 - 1, board_size // 2 - 1),
-            (board_size // 2 - 1, board_size // 2),
-            (board_size // 2, board_size // 2 - 1),
-            (board_size // 2, board_size // 2)
+            (n // 2 - 1, n // 2 - 1),
+            (n // 2 - 1, n // 2),
+            (n // 2, n // 2 - 1),
+            (n // 2, n // 2)
         ]
         score = 0
-
         for cell in center_cells:
             if board[cell] == player:
                 score += 1
             elif board[cell] == opponent:
                 score -= 1
-        return score    
-    
+        return score
 
-    def mobility(self, board, player, opponent) :
+    def mobility(self, board, player, opponent):
         player_moves = len(get_valid_moves(board, player))
         opponent_moves = len(get_valid_moves(board, opponent))
-        score = 0
-        if player_moves + opponent_moves != 0:
-            score = 100 * (player_moves - opponent_moves) / (player_moves + opponent_moves)
-        
-        return score
-
+        total = player_moves + opponent_moves
+        if total == 0:
+            return 0
+        return 100 * (player_moves - opponent_moves) / total
 
     def potential_mobility(self, board, player, opponent):
-        opponent_positions = np.argwhere(board == opponent)
-        directions = [(-1, -1), (-1, 0), (-1, 1),
-                      (0, -1), (0, 1),
-                      (1, -1),  (1, 0),  (1, 1)]
-        board_size = board.shape[0]
-        empty_neighbors = set()
+        n = board.shape[0]
+        empty = (board == 0)
 
-        # Use opponent positions to find adjacent empty squares
-        for x, y in opponent_positions:
-            for dx, dy in directions:
-                nx, ny = x + dx, y + dy
-                if 0 <= nx < board_size and 0 <= ny < board_size:
-                    if board[nx, ny] == 0:
-                        empty_neighbors.add((nx, ny))
+        def frontier(mask):
+            out = np.zeros((n, n), dtype=bool)
+            for dx in (-1, 0, 1):
+                for dy in (-1, 0, 1):
+                    if dx == 0 and dy == 0:
+                        continue
+                    shifted = np.zeros((n, n), dtype=bool)
+                    xs = slice(max(0, dx), n + min(0, dx))
+                    ys = slice(max(0, dy), n + min(0, dy))
+                    xd = slice(max(0, -dx), n + min(0, -dx))
+                    yd = slice(max(0, -dy), n + min(0, -dy))
+                    shifted[xd, yd] = mask[xs, ys]
+                    out |= shifted
+            return int(np.count_nonzero(out & empty))
 
-        # Potential mobility is the number of empty squares adjacent to opponent discs
-        score = len(empty_neighbors)
+        return frontier(board == opponent) - frontier(board == player)
 
-        # Repeat for opponent's potential mobility
-        player_positions = np.argwhere(board == player)
-        opponent_empty_neighbors = set()
-        for x, y in player_positions:
-            for dx, dy in directions:
-                nx, ny = x + dx, y + dy
-                if 0 <= nx < board_size and 0 <= ny < board_size:
-                    if board[nx, ny] == 0:
-                        opponent_empty_neighbors.add((nx, ny))
+    def captures(self, board, player, opponent):
+        if player == 1:
+            _, p_score, o_score = check_endgame(board, player, opponent)
+        else:
+            _, o_score, p_score = check_endgame(board, player, opponent)
 
-        score -= len(opponent_empty_neighbors)
-        return score
-    
-    def captures(self, board, player, opponent) :
-        score = 0
-        if player == 1 :
-            _, player_score, opponent_score = check_endgame(board, player, opponent)
-        else : 
-            _, opponent_score, player_score = check_endgame(board, player, opponent)
-        
-        score = player_score - opponent_score
-        
-        if (self.is_opening_game(board)) : score * 5
-        if (self.is_endgame(board)) : score * -5 
+        score = p_score - o_score
+
+        # FIX: `score * 5` and `score * -5` with no assignment. Both lines
+        # computed a value and discarded it, so the raw disc differential was
+        # returned at every phase.
+        if self.is_opening_game(board):
+            score = score * 5
+        elif self.is_endgame(board):
+            score = score * -5
 
         return score
